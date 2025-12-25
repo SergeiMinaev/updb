@@ -14,9 +14,17 @@ FNAME = conf.FNAME
 TAG = '# '
 
 
+def _is_only_notice(stderr_bytes):
+	if stderr_bytes == b'':
+		return False
+	lines = stderr_bytes.decode(errors='replace').splitlines()
+	non_empty = [line.strip() for line in lines if line.strip() != '']
+	return len(non_empty) > 0 and all(line.startswith('NOTICE:') for line in non_empty)
+
+
 def exec_cmd(cmd):
 	r = subprocess.run(shlex.split(cmd), stderr=subprocess.PIPE, stdout=subprocess.PIPE)
-	if r.stderr != b'':
+	if r.stderr != b'' and not _is_only_notice(r.stderr):
 		print(r.stderr)
 		sys.exit()
 	return r
@@ -26,7 +34,7 @@ def last_applied():
 	cmd = f"{BASE_CMD} 'select public.last_migration_n()'"
 	r = subprocess.run(shlex.split(cmd), stderr=subprocess.PIPE, stdout=subprocess.PIPE)
 	if b'does not exist' in r.stderr: return None
-	if r.stderr != b'':
+	if r.stderr != b'' and not _is_only_notice(r.stderr):
 		print(r.stderr)
 		sys.exit()
 	return int(r.stdout.strip())
