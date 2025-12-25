@@ -23,7 +23,11 @@ def _is_only_notice(stderr_bytes):
 
 
 def exec_cmd(cmd):
-	r = subprocess.run(shlex.split(cmd), stderr=subprocess.PIPE, stdout=subprocess.PIPE)
+	if isinstance(cmd, (list, tuple)):
+		run_cmd = list(cmd)
+	else:
+		run_cmd = shlex.split(cmd)
+	r = subprocess.run(run_cmd, stderr=subprocess.PIPE, stdout=subprocess.PIPE)
 	if r.stderr != b'' and not _is_only_notice(r.stderr):
 		print(r.stderr)
 		sys.exit()
@@ -31,8 +35,8 @@ def exec_cmd(cmd):
 
 
 def last_applied():
-	cmd = f"{BASE_CMD} 'select public.last_migration_n()'"
-	r = subprocess.run(shlex.split(cmd), stderr=subprocess.PIPE, stdout=subprocess.PIPE)
+	cmd = ["psql", "-tA", "-U", conf.USER, conf.DBNAME, "-c", "select public.last_migration_n()"]
+	r = subprocess.run(cmd, stderr=subprocess.PIPE, stdout=subprocess.PIPE)
 	if b'does not exist' in r.stderr: return None
 	if r.stderr != b'' and not _is_only_notice(r.stderr):
 		print(r.stderr)
@@ -117,8 +121,7 @@ def apply():
 				q = ''.join(lines).split(f'\n{TAG}{n}')[1].split(TAG)[0].strip()
 				print(f'\n>>> This query will be executed:\n{q}')
 				if input('\n>>> Apply? ').lower() == 'y':
-					q = q.replace('\n', ' ')
-					cmd = f'''{BASE_CMD} "{q}"'''
+					cmd = ["psql", "-tA", "-U", conf.USER, conf.DBNAME, "-c", q]
 					exec_cmd(cmd)
 					update_last_applied(n)
 					print('>>> Applied successfully.\n')
