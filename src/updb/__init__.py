@@ -168,6 +168,13 @@ def dump_schema():
 		open(f'{conf.SCHEMA_DIR}/{table}.sql', 'w').write(fin)
 
 def run():
+	if len(sys.argv) > 1 and sys.argv[1] == 'status':
+		n = last_applied()
+		if n is None:
+			print('>>> No applied migrations yet.')
+		else:
+			print('>>> Last applied migration number:', n)
+		return
 	check_last_applied()
 	enumerate_migrations()
 	apply()
