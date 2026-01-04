@@ -8,7 +8,7 @@ sys.path.insert(0, os.getcwd())
 import updb_conf as conf
 
 
-BASE_CMD = f'psql -tA -U {conf.USER} {conf.DBNAME} -c'
+BASE_CMD = f'psql -X -tA -U {conf.USER} {conf.DBNAME} -c'
 FNAME = conf.FNAME
 TAG = '# '
 
@@ -33,15 +33,28 @@ def exec_cmd(cmd):
 	return r
 
 
+def _parse_last_applied_output(stdout_bytes):
+	text = stdout_bytes.decode(errors='replace')
+	for line in reversed(text.splitlines()):
+		line = line.strip()
+		if line.isdigit():
+			return int(line)
+	raise ValueError(text.strip())
+
+
 def last_applied():
-	cmd = ["psql", "-tA", "-U", conf.USER, conf.DBNAME, "-c", "select public.last_migration_n()"]
+	cmd = ["psql", "-X", "-tA", "-U", conf.USER, conf.DBNAME, "-c", "select public.last_migration_n()"]
 	r = subprocess.run(cmd, stderr=subprocess.PIPE, stdout=subprocess.PIPE)
 	if b'does not exist' in r.stderr:
 		return None
 	if r.stderr != b'' and not _is_only_notice(r.stderr):
 		print(r.stderr)
 		sys.exit()
-	return int(r.stdout.strip())
+	try:
+		return _parse_last_applied_output(r.stdout)
+	except ValueError as exc:
+		print(f'Error: unexpected output from psql: {exc}')
+		sys.exit()
 
 
 def check_last_applied():
@@ -121,7 +134,7 @@ def apply():
 				q = ''.join(lines).split(f'\n{TAG}{n}')[1].split(TAG)[0].strip()
 				print(f'\n>>> This query will be executed:\n{q}')
 				if input('\n>>> Apply? ').lower() == 'y':
-					cmd = ["psql", "-tA", "-U", conf.USER, conf.DBNAME, "-c", q]
+					cmd = ["psql", "-X", "-tA", "-U", conf.USER, conf.DBNAME, "-c", q]
 					exec_cmd(cmd)
 					update_last_applied(n)
 					print('>>> Applied successfully.\n')
