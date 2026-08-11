@@ -28,6 +28,27 @@ Additionally it will appeared in migrations.sql at the first line.
 6) When you want to create new migrations, just add it to migrations.sql and run `updb` again.
 7) If you need to create an empty DB for tests, use schema/schema.sql . Older versions are available via Git.
 
+# Non-interactive usage
+
+Use `--yes` to enumerate and apply all pending migrations without confirmation prompts:
+
+```bash
+updb --yes
+```
+
+For deployments, `--no-write-migrations` keeps `migrations.sql` unchanged. Migration
+numbers are still assigned deterministically and the applied number is stored in the
+database:
+
+```bash
+updb --yes --no-write-migrations
+```
+
+Non-interactive mode does not initialize a database without a migration counter. Run
+`updb set 0` manually after verifying the database configuration. Every migration and
+the corresponding counter update are executed in one transaction. PostgreSQL errors
+stop the command with a non-zero exit code.
+
 Suggested directory structure:
 ```
 ./project/db/migrations.sql

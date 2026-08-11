@@ -1,181 +1,245 @@
 import os
 import re
-import sys
 import shlex
 import subprocess
+import sys
 
 sys.path.insert(0, os.getcwd())
 import updb_conf as conf
 
 
-BASE_CMD = f'psql -X -tA -U {conf.USER} {conf.DBNAME} -c'
+BASE_CMD = f"psql -X -v ON_ERROR_STOP=1 -tA -U {conf.USER} {conf.DBNAME} -c"
 FNAME = conf.FNAME
-TAG = '# '
+TAG = "# "
 
 
 def _is_only_notice(stderr_bytes):
-	if stderr_bytes == b'':
-		return False
-	lines = stderr_bytes.decode(errors='replace').splitlines()
-	non_empty = [line.strip() for line in lines if line.strip() != '']
-	return len(non_empty) > 0 and all(line.startswith('NOTICE:') for line in non_empty)
+    if stderr_bytes == b"":
+        return False
+    lines = stderr_bytes.decode(errors="replace").splitlines()
+    non_empty = [line.strip() for line in lines if line.strip() != ""]
+    return len(non_empty) > 0 and all(line.startswith("NOTICE:") for line in non_empty)
+
+
+def _fail(message, exit_code=1):
+    print(message, file=sys.stderr)
+    raise SystemExit(exit_code or 1)
+
+
+def _psql_command(query, single_transaction=False):
+    command = [
+        "psql",
+        "-X",
+        "-v",
+        "ON_ERROR_STOP=1",
+        "-tA",
+        "-U",
+        conf.USER,
+        conf.DBNAME,
+    ]
+    if single_transaction:
+        command.append("--single-transaction")
+    command.extend(["-c", query])
+    return command
 
 
 def exec_cmd(cmd):
-	if isinstance(cmd, (list, tuple)):
-		run_cmd = list(cmd)
-	else:
-		run_cmd = shlex.split(cmd)
-	r = subprocess.run(run_cmd, stderr=subprocess.PIPE, stdout=subprocess.PIPE)
-	if r.stderr != b'' and not _is_only_notice(r.stderr):
-		print(r.stderr)
-		sys.exit()
-	return r
+    run_cmd = list(cmd) if isinstance(cmd, (list, tuple)) else shlex.split(cmd)
+    result = subprocess.run(run_cmd, stderr=subprocess.PIPE, stdout=subprocess.PIPE)
+    if result.returncode != 0:
+        error = result.stderr.decode(errors="replace").strip()
+        _fail(error or f"Command failed with exit code {result.returncode}", result.returncode)
+    return result
 
 
 def _parse_last_applied_output(stdout_bytes):
-	text = stdout_bytes.decode(errors='replace')
-	for line in reversed(text.splitlines()):
-		line = line.strip()
-		if line.isdigit():
-			return int(line)
-	raise ValueError(text.strip())
+    text = stdout_bytes.decode(errors="replace")
+    for line in reversed(text.splitlines()):
+        line = line.strip()
+        if line.isdigit():
+            return int(line)
+    raise ValueError(text.strip())
 
 
 def last_applied():
-	cmd = ["psql", "-X", "-tA", "-U", conf.USER, conf.DBNAME, "-c", "select public.last_migration_n()"]
-	r = subprocess.run(cmd, stderr=subprocess.PIPE, stdout=subprocess.PIPE)
-	if b'does not exist' in r.stderr:
-		return None
-	if r.stderr != b'' and not _is_only_notice(r.stderr):
-		print(r.stderr)
-		sys.exit()
-	try:
-		return _parse_last_applied_output(r.stdout)
-	except ValueError as exc:
-		print(f'Error: unexpected output from psql: {exc}')
-		sys.exit()
+    query = "select public.last_migration_n()"
+    result = subprocess.run(
+        _psql_command(query),
+        stderr=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+    )
+    if result.returncode != 0:
+        if b"function public.last_migration_n() does not exist" in result.stderr:
+            return None
+        error = result.stderr.decode(errors="replace").strip()
+        _fail(error or f"psql failed with exit code {result.returncode}", result.returncode)
+    try:
+        return _parse_last_applied_output(result.stdout)
+    except ValueError as error:
+        _fail(f"Error: unexpected output from psql: {error}")
 
 
-def check_last_applied():
-	if last_applied() is None:
-		handle_notexist_last_applied()
-		last_applied()
+def check_last_applied(assume_yes=False):
+    if last_applied() is not None:
+        return
+    if assume_yes:
+        _fail(
+            ">>> Migration counter does not exist. "
+            "Initialize it manually with `updb set 0`."
+        )
+    handle_notexist_last_applied()
 
 
 def handle_notexist_last_applied():
-	print('>>> It looks like this database has no applied migrations yet.',
-		'I will set the migration counter to zero. If this is a mistake, do not continue!')
-	if input('Continue? ').lower() == 'y':
-		init_last_applied()
-	else:
-		print('Closing.')
-		sys.exit()
+    print(
+        ">>> It looks like this database has no applied migrations yet. "
+        "I will set the migration counter to zero. If this is a mistake, do not continue!"
+    )
+    if input("Continue? ").lower() == "y":
+        init_last_applied()
+        return
+    _fail("Closing.")
 
 
 def init_last_applied():
-	update_last_applied(0)
+    update_last_applied(0)
 
 
-def update_last_applied(n):
-	lines = open(FNAME).readlines()
-	last_applied = '#LAST_APPLIED: ' + str(n) + '\n'
-	if lines[0].startswith('#LAST_APPLIED'):
-		lines[0] = last_applied
-	else:
-		lines = [last_applied + '\n'] + lines
-	open(FNAME, 'w').write(''.join(lines))
-	q = 'create or replace function public.last_migration_n() '\
-		f"RETURNS int LANGUAGE sql PARALLEL SAFE AS 'select {n}'";
-	cmd = f'{BASE_CMD} "{q}"'
-	exec_cmd(cmd)
-	print(f'>>> Migration counter was set to {n}.')
+def _last_applied_query(number):
+    return (
+        "create or replace function public.last_migration_n() "
+        f"returns int language sql parallel safe as 'select {number}';"
+    )
 
 
-def enumerate_migrations():
-	f = open(FNAME)
-	lines = f.readlines()
-	f.close()
-	new = ''
-	n = 1
-	for line in lines:
-		if line.startswith(TAG):
-			n = int(line.strip(TAG)) + 1
-	ln = 0
-	while ln < len(lines):
-		line = lines[ln]
-		nextline = lines[ln+1] if ln+1 < len(lines) else ''
-		if (line.strip() == '' and not nextline.startswith(TAG)):
-			new += f'\n{TAG}{n}'
-			n += 1
-		new += line
-		ln += 1
-
-	print(new)
-	if	input('\n>>> Correct? ').lower() == 'y':
-		f = open(FNAME, 'w')
-		f.write(new)
-		f.close()
-		print('>>> OK. Now lets apply.')
-	else:
-		sys.exit()
+def _write_last_applied(number):
+    with open(FNAME) as migrations_file:
+        lines = migrations_file.readlines()
+    last_applied_line = f"#LAST_APPLIED: {number}\n"
+    if lines and lines[0].startswith("#LAST_APPLIED"):
+        lines[0] = last_applied_line
+    else:
+        lines = [last_applied_line, "\n", *lines]
+    with open(FNAME, "w") as migrations_file:
+        migrations_file.write("".join(lines))
 
 
-def apply():
-	lines = open(FNAME).readlines()
-	last_n = last_applied()
-	print('>>> Last applied migration number:', last_n)
-	is_any_unapplied_found = False
-	for line in lines:
-		if line.startswith(TAG):
-			n = int(line.strip(TAG))
-			if n > last_n:
-				is_any_unapplied_found = True
-				q = ''.join(lines).split(f'\n{TAG}{n}')[1].split(TAG)[0].strip()
-				print(f'\n>>> This query will be executed:\n{q}')
-				if input('\n>>> Apply? ').lower() == 'y':
-					cmd = ["psql", "-X", "-tA", "-U", conf.USER, conf.DBNAME, "-c", q]
-					exec_cmd(cmd)
-					update_last_applied(n)
-					print('>>> Applied successfully.\n')
-				else:
-					sys.exit()
-	if not is_any_unapplied_found:
-		print('>>> No unapplied migrations found.')
+def update_last_applied(number, write_file=True):
+    exec_cmd(_psql_command(_last_applied_query(number)))
+    if write_file:
+        _write_last_applied(number)
+    print(f">>> Migration counter was set to {number}.")
+
+
+def _enumerated_migrations(lines):
+    migration_numbers = [
+        int(match.group(1))
+        for line in lines
+        if (match := re.fullmatch(r"# (\d+)\s*", line))
+    ]
+    number = max(migration_numbers, default=0) + 1
+    result = ""
+    for index, line in enumerate(lines):
+        next_line = lines[index + 1] if index + 1 < len(lines) else ""
+        if line.strip() == "" and next_line and not next_line.startswith(TAG):
+            result += f"\n{TAG}{number}"
+            number += 1
+        result += line
+    return result
+
+
+def enumerate_migrations(assume_yes=False, write_file=True):
+    with open(FNAME) as migrations_file:
+        numbered = _enumerated_migrations(migrations_file.readlines())
+
+    print(numbered)
+    if not assume_yes and input("\n>>> Correct? ").lower() != "y":
+        _fail("Closing.")
+    if write_file:
+        with open(FNAME, "w") as migrations_file:
+            migrations_file.write(numbered)
+    print(">>> OK. Now lets apply.")
+    return numbered
+
+
+def _migrations(migrations_text):
+    markers = list(re.finditer(r"(?m)^# (\d+)\s*$", migrations_text))
+    for index, marker in enumerate(markers):
+        end = markers[index + 1].start() if index + 1 < len(markers) else len(migrations_text)
+        yield int(marker.group(1)), migrations_text[marker.end():end].strip()
+
+
+def _migration_transaction(query, number):
+    query = query.rstrip()
+    if query and not query.endswith(";"):
+        query += ";"
+    return f"{query}\n{_last_applied_query(number)}"
+
+
+def apply(migrations_text=None, assume_yes=False, write_file=True):
+    if migrations_text is None:
+        with open(FNAME) as migrations_file:
+            migrations_text = migrations_file.read()
+
+    last_number = last_applied()
+    if last_number is None:
+        _fail(">>> Migration counter does not exist.")
+    print(">>> Last applied migration number:", last_number)
+    unapplied_found = False
+    for number, query in _migrations(migrations_text):
+        if number <= last_number:
+            continue
+        unapplied_found = True
+        print(f"\n>>> This query will be executed:\n{query}")
+        if not assume_yes and input("\n>>> Apply? ").lower() != "y":
+            _fail("Closing.")
+        exec_cmd(
+            _psql_command(
+                _migration_transaction(query, number),
+                single_transaction=True,
+            )
+        )
+        if write_file:
+            _write_last_applied(number)
+        print(">>> Applied successfully.\n")
+    if not unapplied_found:
+        print(">>> No unapplied migrations found.")
 
 
 def tables_list():
-	cmd = f'{BASE_CMD} "select table_name from information_schema.tables where table_schema = \'public\'";'
-	r = exec_cmd(cmd)
-	tables = r.stdout.decode().split('\n')
-	return [str(table).strip() for table in tables if table.strip() != '']
+    query = (
+        "select table_name from information_schema.tables "
+        "where table_schema = 'public'"
+    )
+    result = exec_cmd(_psql_command(query))
+    return [table.strip() for table in result.stdout.decode().splitlines() if table.strip()]
 
 
 def dump_schema():
-	if not os.path.exists(conf.SCHEMA_DIR):
-		print('Error: schema dir', conf.SCHEMA_DIR, 'does not exists.')
-		sys.exit()
-	elif not os.path.isdir(conf.SCHEMA_DIR):
-		print('Error:', conf.SCHEMA_DIR, 'is not a directory.')
-		sys.exit()
+    if not os.path.exists(conf.SCHEMA_DIR):
+        _fail(f"Error: schema dir {conf.SCHEMA_DIR} does not exist.")
+    if not os.path.isdir(conf.SCHEMA_DIR):
+        _fail(f"Error: {conf.SCHEMA_DIR} is not a directory.")
 
-	cmd = f'pg_dump --schema-only -U {conf.USER} {conf.DBNAME}'
-	r = exec_cmd(cmd)
-	open(f'{conf.SCHEMA_DIR}/schema.sql', 'w').write(r.stdout.decode())
+    result = exec_cmd(["pg_dump", "--schema-only", "-U", conf.USER, conf.DBNAME])
+    with open(f"{conf.SCHEMA_DIR}/schema.sql", "w") as schema_file:
+        schema_file.write(result.stdout.decode())
 
-	for table in tables_list():
-		print(f'Saving schema of {table} to {conf.SCHEMA_DIR}/{table}.sql')
-		cmd = f'pg_dump --schema-only -U {conf.USER} {conf.DBNAME} -t {table} -O'
-		r = exec_cmd(cmd)
-		s = r.stdout.decode()
-		fin = ''
-		for line in s.split('\n'):
-			if (not line.startswith('--')
-					and not line.startswith('SET ')
-					and not line.startswith('SELECT pg_catalog.set_config')
-					#and line.strip() != ''
-			):
-				fin += line + '\n'
-		fin = re.sub(r'\n\n+', '\n\n', fin)
-		fin = re.sub(r'^\n+', '', fin)
-		open(f'{conf.SCHEMA_DIR}/{table}.sql', 'w').write(fin)
+    for table in tables_list():
+        path = f"{conf.SCHEMA_DIR}/{table}.sql"
+        print(f"Saving schema of {table} to {path}")
+        result = exec_cmd(
+            ["pg_dump", "--schema-only", "-U", conf.USER, conf.DBNAME, "-t", table, "-O"]
+        )
+        schema = ""
+        for line in result.stdout.decode().splitlines():
+            if (
+                not line.startswith("--")
+                and not line.startswith("SET ")
+                and not line.startswith("SELECT pg_catalog.set_config")
+            ):
+                schema += line + "\n"
+        schema = re.sub(r"\n\n+", "\n\n", schema)
+        schema = re.sub(r"^\n+", "", schema)
+        with open(path, "w") as schema_file:
+            schema_file.write(schema)
